@@ -28,6 +28,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     var limits by mutableStateOf<Map<String, Int>>(emptyMap()); private set   // ip -> kbps
     var whitelist by mutableStateOf<Set<String>>(emptySet()); private set     // macs
 
+    // Per-device traffic meter. monitoring != null while a device is metered.
+    var monitoring by mutableStateOf<Device?>(null); private set
+    var meterDownRate by mutableStateOf(0L); private set   // bytes/sec, download
+    var meterUpRate by mutableStateOf(0L); private set     // bytes/sec, upload
+    var meterDownTotal by mutableStateOf(0L); private set  // bytes since meter start
+    var meterUpTotal by mutableStateOf(0L); private set
+    private var meterJob: Job? = null
+
     private val prefs = app.getSharedPreferences("bettercut", Application.MODE_PRIVATE)
     private var scanJob: Job? = null
     private var started = false
@@ -38,10 +46,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private var appliedLimitIps: Set<String> = emptySet()
 
     // Serializes limit applies (they touch root/iptables) so concurrent taps can't
-    // interleave, and records the last set actually pushed to NetScan so identical
-    // repeats collapse. Both are only touched on the Main dispatcher.
+    // interleave. NetScan fully reconciles to the latest set each time.
     private val applyMutex = Mutex()
-    private var enforced: Map<String, Int> = emptyMap()
     private var repairedOnLaunch = false   // blanket un-poison once, if nothing to restore
 
     init {
@@ -77,9 +83,6 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             // An external clear (notification Restore all) means nothing is
             // enforced anymore; let the next scan re-establish whatever remains.
             appliedLimitIps = appliedLimitIps intersect fresh.keys
-            // NetScan's actual state was changed out from under us, so forget what
-            // we think is enforced — the next apply must not collapse as a no-op.
-            enforced = emptyMap()
             status = if (fresh.isEmpty()) "Restored" else "${fresh.size} limited"
         }
     }
@@ -172,15 +175,63 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             applyMutex.withLock {
                 // Read the LATEST intended state at execution time (not the map
                 // captured when this coroutine was queued), so a burst of taps
-                // can't let a stale set win. Collapse no-op repeats so we don't
-                // needlessly kill+repoison — a visible blip — for no change.
+                // can't let a stale set win. NetScan.applyLimits fully reconciles
+                // to this set every time, so it's always exactly what's enforced.
                 val current = limits
-                if (current == enforced) return@withLock
-                enforced = current
                 val victims = devices.filter { it.ip in current }.map { it to current.getValue(it.ip) }
                 withContext(Dispatchers.IO) { runCatching { NetScan.applyLimits(getApplication(), victims) } }
                     .onFailure { status = "Limit error: ${it.message}" }
             }
+        }
+    }
+
+    /** Starts the live traffic meter for [device]: MITMs it, forwards its traffic,
+     *  and polls iptables byte counters once a second for up/down speed + totals.
+     *  Mutually exclusive with cuts, which resume when the meter stops. */
+    fun startMeter(device: Device) {
+        if (monitoring?.ip == device.ip) return
+        if (monitoring != null) meterJob?.cancel()
+        monitoring = device
+        meterDownRate = 0L; meterUpRate = 0L; meterDownTotal = 0L; meterUpTotal = 0L
+        meterJob = viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) { NetScan.startMonitor(getApplication(), device) }
+            if (!ok) {
+                status = "Can't meter ${device.displayName}"
+                monitoring = null
+                return@launch
+            }
+            status = "Metering ${device.displayName}…"
+            var base: LongArray? = null
+            var prev: LongArray? = null
+            while (monitoring?.ip == device.ip) {
+                delay(1000)
+                val s = withContext(Dispatchers.IO) { NetScan.readMeter() } ?: break
+                if (base == null) base = s
+                prev?.let {
+                    meterDownRate = (s[0] - it[0]).coerceAtLeast(0)  // 1 s poll → bytes/sec
+                    meterUpRate = (s[1] - it[1]).coerceAtLeast(0)
+                }
+                meterDownTotal = (s[0] - base[0]).coerceAtLeast(0)
+                meterUpTotal = (s[1] - base[1]).coerceAtLeast(0)
+                prev = s
+            }
+        }
+    }
+
+    /** Stops the meter, un-poisons the device, and re-establishes any cuts. */
+    fun stopMeter() {
+        if (monitoring == null) return
+        monitoring = null
+        meterJob?.cancel()
+        meterJob = null
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { NetScan.stopMonitor(getApplication()) } }
+            // Resume any cuts that were paused while metering.
+            val victims = devices.filter { it.ip in limits }.map { it to limits.getValue(it.ip) }
+            if (victims.isNotEmpty()) {
+                withContext(Dispatchers.IO) { runCatching { NetScan.applyLimits(getApplication(), victims) } }
+            }
+            status = if (limits.isEmpty()) "Idle" else "${limits.size} limited"
         }
     }
 
@@ -199,9 +250,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun fullExit() {
         scanning = false
         scanJob?.cancel()
+        monitoring = null
+        meterJob?.cancel()
         limits = emptyMap()
         appliedLimitIps = emptySet()
-        enforced = emptyMap()
         persistLimits(emptyMap())   // a full exit should not restore limits next launch
         NetScan.exit(getApplication())
     }

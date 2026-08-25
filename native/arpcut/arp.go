@@ -74,3 +74,46 @@ func parseVictims(args []string) []victim {
 	}
 	return vs
 }
+
+// parseArpTable finds the CURRENT MAC for ip on iface in the kernel ARP table
+// (the contents of /proc/net/arp), or nil. Only COMPLETE entries count —
+// incomplete (flags 0x0) or all-zero entries are ignored, exactly like
+// bettercap's ArpLookup — so we never poison against a half-resolved neighbour.
+// Columns: "IPaddress  HWtype  Flags  HWaddress  Mask  Device".
+func parseArpTable(content, ip, iface string) net.HardwareAddr {
+	for _, line := range strings.Split(content, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 6 || f[0] != ip || f[5] != iface {
+			continue
+		}
+		if f[2] == "0x0" || f[3] == "00:00:00:00:00:00" {
+			continue // incomplete / unresolved
+		}
+		if mac, err := net.ParseMAC(f[3]); err == nil {
+			return mac
+		}
+	}
+	return nil
+}
+
+// arpTableLookup reads the live kernel ARP table for ip on iface.
+func arpTableLookup(ip, iface string) net.HardwareAddr {
+	data, err := os.ReadFile("/proc/net/arp")
+	if err != nil {
+		return nil
+	}
+	return parseArpTable(string(data), ip, iface)
+}
+
+// macEqual reports whether two hardware addresses are the same (nil-safe).
+func macEqual(a, b net.HardwareAddr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

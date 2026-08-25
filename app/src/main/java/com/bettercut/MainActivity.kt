@@ -16,16 +16,20 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.DevicesOther
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PowerSettingsNew
@@ -36,6 +40,7 @@ import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Smartphone
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material.icons.rounded.WifiOff
@@ -129,7 +134,13 @@ fun ScannerScreen(vm: ScanViewModel = viewModel()) {
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val obs = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) vm.reloadFromPrefs()
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> vm.reloadFromPrefs()
+                // Don't keep MITM-ing a device while backgrounded — stop the meter
+                // so it can't hairpin traffic through the phone unattended.
+                Lifecycle.Event.ON_PAUSE -> vm.stopMeter()
+                else -> {}
+            }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
@@ -141,6 +152,8 @@ fun ScannerScreen(vm: ScanViewModel = viewModel()) {
     var menuOpen by remember { mutableStateOf(false) }
     var confirmCutAll by remember { mutableStateOf(false) }
     var throttleAllOpen by remember { mutableStateOf(false) }
+    var diagText by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
     val devices = vm.devices
     val limits = vm.limits
@@ -196,6 +209,18 @@ fun ScannerScreen(vm: ScanViewModel = viewModel()) {
                             enabled = limits.isNotEmpty(),
                             onClick = { menuOpen = false; vm.applyLimits(emptyMap()) },
                         )
+                        DropdownMenuItem(
+                            text = { Text("Diagnostics") },
+                            leadingIcon = { Icon(Icons.Rounded.BugReport, null) },
+                            onClick = {
+                                menuOpen = false
+                                diagText = "Running…"
+                                scope.launch {
+                                    val t = withContext(Dispatchers.IO) { NetScan.diagnostics() }
+                                    diagText = t
+                                }
+                            },
+                        )
                         HorizontalDivider()
                         DropdownMenuItem(
                             text = { Text("Full exit") },
@@ -245,6 +270,7 @@ fun ScannerScreen(vm: ScanViewModel = viewModel()) {
                                 )
                             },
                             onWhitelistToggle = { vm.toggleWhitelist(d.mac) },
+                            onMeter = { vm.startMeter(d) },
                         )
                     }
                 }
@@ -290,6 +316,111 @@ fun ScannerScreen(vm: ScanViewModel = viewModel()) {
             },
         )
     }
+
+    // Live per-device traffic meter.
+    vm.monitoring?.let { dev ->
+        MeterDialog(
+            device = dev,
+            downRate = vm.meterDownRate,
+            upRate = vm.meterUpRate,
+            downTotal = vm.meterDownTotal,
+            upTotal = vm.meterUpTotal,
+            onStop = { vm.stopMeter() },
+        )
+    }
+
+    diagText?.let { text ->
+        AlertDialog(
+            onDismissRequest = { diagText = null },
+            icon = { Icon(Icons.Rounded.BugReport, null) },
+            title = { Text("Diagnostics") },
+            text = {
+                Text(
+                    text,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState()),
+                )
+            },
+            confirmButton = { TextButton(onClick = { diagText = null }) { Text("Close") } },
+        )
+    }
+}
+
+@Composable
+private fun MeterDialog(
+    device: Device,
+    downRate: Long,
+    upRate: Long,
+    downTotal: Long,
+    upTotal: Long,
+    onStop: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onStop,
+        icon = { Icon(Icons.Rounded.SwapVert, null) },
+        title = { Text("Live traffic") },
+        text = {
+            Column {
+                Text(
+                    device.displayName,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    device.ip,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(16.dp))
+                MeterRow("Download", downRate, downTotal, MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(10.dp))
+                MeterRow("Upload", upRate, upTotal, MaterialTheme.colorScheme.secondary)
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "This routes the device's traffic through your phone to measure " +
+                        "it. Stop when you're done.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = onStop) { Text("Stop") } },
+    )
+}
+
+@Composable
+private fun MeterRow(label: String, rate: Long, total: Long, color: Color) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            fmtRate(rate),
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold,
+            color = color,
+        )
+    }
+    Text(
+        "Total ${fmtBytes(total)}",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+private fun fmtRate(bytesPerSec: Long): String = fmtBytes(bytesPerSec) + "/s"
+
+private fun fmtBytes(b: Long): String = when {
+    b >= 1_000_000_000 -> "%.2f GB".format(b / 1_000_000_000.0)
+    b >= 1_000_000 -> "%.1f MB".format(b / 1_000_000.0)
+    b >= 1_000 -> "%.0f KB".format(b / 1_000.0)
+    else -> "$b B"
 }
 
 @Composable
@@ -332,6 +463,7 @@ private fun DeviceCard(
     onCutToggle: () -> Unit,
     onSetLimit: (Int?) -> Unit,
     onWhitelistToggle: () -> Unit,
+    onMeter: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
     val isCut = limitKbps == 0
@@ -420,11 +552,12 @@ private fun DeviceCard(
             }
             DeviceMenu(
                 // Whitelisted hosts still get a menu — to *remove* them from the
-                // whitelist — but no throttle option. Gateway/self get nothing.
+                // whitelist — but no throttle/meter option. Gateway/self get nothing.
                 isWhitelisted = isWhitelisted,
                 showActions = canAct || (isWhitelisted && "." in d.ip),
                 canThrottle = canAct,
                 onSpeed = { showSpeed = true },
+                onMeter = onMeter,
                 onWhitelistToggle = onWhitelistToggle,
             )
         }
@@ -486,6 +619,7 @@ private fun DeviceMenu(
     showActions: Boolean,
     canThrottle: Boolean,
     onSpeed: () -> Unit,
+    onMeter: () -> Unit,
     onWhitelistToggle: () -> Unit,
 ) {
     if (!showActions) { Spacer(Modifier.width(4.dp)); return }
@@ -494,6 +628,11 @@ private fun DeviceMenu(
         IconButton(onClick = { open = true }) { Icon(Icons.Rounded.MoreVert, "Options") }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             if (canThrottle) {
+                DropdownMenuItem(
+                    text = { Text("Live traffic…") },
+                    leadingIcon = { Icon(Icons.Rounded.SwapVert, null) },
+                    onClick = { open = false; onMeter() },
+                )
                 DropdownMenuItem(
                     text = { Text("Speed limit…") },
                     leadingIcon = { Icon(Icons.Rounded.Speed, null) },

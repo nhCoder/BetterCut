@@ -105,3 +105,55 @@ func TestParseVictimsEmpty(t *testing.T) {
 		t.Fatalf("nil args should yield 0 victims, got %d", len(got))
 	}
 }
+
+const arpTable = `IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.1      0x1         0x2         aa:bb:cc:dd:ee:01     *        wlan0
+192.168.1.20     0x1         0x2         aa:bb:cc:dd:ee:20     *        wlan0
+192.168.1.33     0x1         0x0         00:00:00:00:00:00     *        wlan0
+192.168.1.44     0x1         0x2         aa:bb:cc:dd:ee:44     *        rmnet0
+`
+
+func TestParseArpTableResolves(t *testing.T) {
+	mac := parseArpTable(arpTable, "192.168.1.20", "wlan0")
+	if mac == nil || mac.String() != "aa:bb:cc:dd:ee:20" {
+		t.Fatalf("got %v, want aa:bb:cc:dd:ee:20", mac)
+	}
+}
+
+func TestParseArpTableSkipsIncomplete(t *testing.T) {
+	// 192.168.1.33 has flags 0x0 (incomplete) + zero MAC → must be ignored.
+	if mac := parseArpTable(arpTable, "192.168.1.33", "wlan0"); mac != nil {
+		t.Fatalf("incomplete entry must not resolve, got %v", mac)
+	}
+}
+
+func TestParseArpTableFiltersByIface(t *testing.T) {
+	// 192.168.1.44 is on rmnet0, not wlan0 → must not match a wlan0 lookup.
+	if mac := parseArpTable(arpTable, "192.168.1.44", "wlan0"); mac != nil {
+		t.Fatalf("wrong-iface entry must not resolve, got %v", mac)
+	}
+	if mac := parseArpTable(arpTable, "192.168.1.44", "rmnet0"); mac == nil {
+		t.Fatal("should resolve on the matching iface")
+	}
+}
+
+func TestParseArpTableMissing(t *testing.T) {
+	if mac := parseArpTable(arpTable, "10.0.0.9", "wlan0"); mac != nil {
+		t.Fatalf("absent ip must be nil, got %v", mac)
+	}
+}
+
+func TestMacEqual(t *testing.T) {
+	a, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+	b, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+	c, _ := net.ParseMAC("aa:bb:cc:dd:ee:00")
+	if !macEqual(a, b) {
+		t.Error("identical MACs should be equal")
+	}
+	if macEqual(a, c) {
+		t.Error("different MACs should not be equal")
+	}
+	if macEqual(a, nil) {
+		t.Error("nil should not equal a MAC")
+	}
+}

@@ -26,16 +26,14 @@ class NetScanRulesTest {
         assertEquals(1, NetScan.kBytesPerSec(-100))
     }
 
-    // --- poisonMode: cut = victim-only, throttle = both ---
+    // --- poisonMode: always full-duplex ("b") so cuts land on devices that
+    // ignore unsolicited ARP replies ---
 
-    @Test fun poisonMode_cutIsVictimOnly() {
-        assertEquals("v", NetScan.poisonMode(0))
-        assertEquals("v", NetScan.poisonMode(-1))
-    }
-
-    @Test fun poisonMode_throttleIsBoth() {
-        assertEquals("b", NetScan.poisonMode(4000))
-        assertEquals("b", NetScan.poisonMode(1))
+    @Test fun poisonMode_isAlwaysFullDuplex() {
+        assertEquals("b", NetScan.poisonMode(0))    // cut
+        assertEquals("b", NetScan.poisonMode(-1))   // cut
+        assertEquals("b", NetScan.poisonMode(4000)) // throttle
+        assertEquals("b", NetScan.poisonMode(1))    // throttle
     }
 
     // --- bettercutRules: cut ---

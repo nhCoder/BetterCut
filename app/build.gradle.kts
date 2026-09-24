@@ -26,8 +26,9 @@ val buildArpcut by tasks.registering(Exec::class) {
 }
 tasks.named("preBuild") { dependsOn(buildArpcut) }
 
-// Release signing credentials live in keystore.properties at the project base.
-val keystorePropertiesFile = rootProject.file("keystore.properties")
+// Prefer the private local signing setup; retain compatibility with older checkouts.
+val keystorePropertiesFile = rootProject.file(".signing/keystore.properties")
+    .takeIf { it.exists() } ?: rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) load(FileInputStream(keystorePropertiesFile))
 }

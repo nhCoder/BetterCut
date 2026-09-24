@@ -9,6 +9,12 @@ Add these repository secrets under **Settings → Secrets and variables → Acti
 | `ANDROID_KEY_ALIAS` | Signing key alias |
 | `ANDROID_KEY_PASSWORD` | Signing key password |
 
+The local signing setup lives in `.signing/` (ignored by Git). Open
+`.signing/github-secrets.env` and create one repository **secret** per line,
+using the name before `=` and the entire value after it. These are secrets,
+not repository variables. Back up this folder securely; GitHub does not return
+secret values after you save them.
+
 Use the same signing key for every release so users can install updates.
 Keep the keystore and passwords out of the public repository, including its history.
 

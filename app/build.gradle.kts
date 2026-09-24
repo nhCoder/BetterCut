@@ -7,6 +7,25 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+val targetAbis = providers.gradleProperty("androidAbis")
+    .map { it.split(',').map(String::trim).distinct() }
+    .getOrElse(supportedAbis)
+require(targetAbis.isNotEmpty() && targetAbis.all { it in supportedAbis }) {
+    "androidAbis must be a comma-separated selection of: ${supportedAbis.joinToString()}"
+}
+val nativeOutput = layout.buildDirectory.dir("generated/arpcut/jniLibs")
+val buildArpcut by tasks.registering(Exec::class) {
+    inputs.files(rootProject.fileTree("native/arpcut") {
+        include("*.go", "go.mod", "go.sum", "build.sh")
+    })
+    inputs.property("abis", targetAbis)
+    outputs.dir(nativeOutput)
+    environment("ARPCUT_OUTPUT_DIR", nativeOutput.get().asFile.absolutePath)
+    commandLine(listOf("sh", rootProject.file("native/arpcut/build.sh").absolutePath) + targetAbis)
+}
+tasks.named("preBuild") { dependsOn(buildArpcut) }
+
 // Release signing credentials live in keystore.properties at the project base.
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
@@ -21,18 +40,19 @@ android {
         applicationId = "com.bettercut"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("1").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("1.0").get()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // bettercap binary is currently built for arm64 only
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += targetAbis
         }
     }
 
-    // Ship the bettercap executable as libbettercap.so and force it to be
+    sourceSets.getByName("main").jniLibs.setSrcDirs(listOf(nativeOutput))
+
+    // Ship the arpcut executable as libarpcut.so and force it to be
     // extracted to the app's nativeLibraryDir, which is the only app-owned
     // location that is not mounted noexec on modern Android.
     packaging {
@@ -43,7 +63,13 @@ android {
 
     signingConfigs {
         create("release") {
-            if (keystorePropertiesFile.exists()) {
+            val signingFile = providers.environmentVariable("ANDROID_KEYSTORE_FILE").orNull
+            if (signingFile != null) {
+                storeFile = file(signingFile)
+                storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").get()
+                keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").get()
+                keyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").get()
+            } else if (keystorePropertiesFile.exists()) {
                 storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
                 storePassword = keystoreProperties["storePassword"] as String
                 keyAlias = keystoreProperties["keyAlias"] as String

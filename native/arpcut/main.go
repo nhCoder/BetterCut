@@ -1,4 +1,4 @@
-// arpcut — tiny root ARP tool for BetterCut (Android arm64, run via `su -c`).
+// arpcut — tiny root ARP tool for BetterCut (Android, run via `su -c`).
 //
 //	arpcut cut <iface> <gwIP> <gwMAC> <secs> <ip@mac>...
 //	    Continuously ARP-poisons each victim <-> gateway so their traffic

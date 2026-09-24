@@ -1,0 +1,104 @@
+name: Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New release tag (for example, v1.1.0)'
+        required: true
+        type: string
+      version_code:
+        description: 'Android version code (integer higher than the previous release)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-apk
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      VERSION_CODE: ${{ inputs.version_code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate release inputs
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Use a tag such as v1.1.0'; exit 1; }
+          [[ "$VERSION_CODE" =~ ^[1-9][0-9]{0,9}$ ]] && (( VERSION_CODE <= 2100000000 )) || { echo 'Invalid Android version code'; exit 1; }
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo 'This tag already exists. Choose a new release tag.'
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: native/arpcut/go.mod
+          cache: false
+
+      - name: Install Android SDK packages
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: Test native helpers
+        working-directory: native/arpcut
+        run: go test ./...
+
+      - name: Build signed universal APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/bettercut-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            [[ -n "${!name}" ]] || { echo "Missing repository secret: $name"; exit 1; }
+          done
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_FILE"
+          bash ./gradlew --no-daemon testDebugUnitTest assembleRelease \
+            -PandroidAbis=arm64-v8a,armeabi-v7a,x86,x86_64 \
+            "-PreleaseVersionName=${RELEASE_TAG#v}" "-PreleaseVersionCode=$VERSION_CODE"
+
+      - name: Verify and prepare APK
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk dist/BetterCut.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify dist/BetterCut.apk
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('dist/BetterCut.apk') as apk:
+              for abi in ('arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'):
+                  assert f'lib/{abi}/libarpcut.so' in apk.namelist(), abi
+          PY
+          cd dist
+          sha256sum BetterCut.apk > BetterCut.apk.sha256
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/BetterCut.apk dist/BetterCut.apk.sha256 \
+            --target "$GITHUB_SHA" --title "BetterCut $RELEASE_TAG" --generate-notes
+
+      - name: Remove signing keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/bettercut-release.jks"
